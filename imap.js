@@ -1119,7 +1119,7 @@ function validateUIDList(uids) {
         if (len > 1)
           uids = ['*'];
         break;
-      } else if (/^(?:[\d]+|\*):(?:[\d]+|\*)$/.test(uids[i]))
+      } else if (/(?:[\d]+|\*):(?:[\d]+|\*)/.test(uids[i]))
         continue;
     }
     intval = parseInt(''+uids[i]);
