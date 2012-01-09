@@ -1565,7 +1565,7 @@ Buffer.prototype.split = function(str) {
       searchLen = search.length,
       ret = [], pos, start = 0;
 
-  while ((pos = this.indexOf(search, start)) > -1) {
+  while ((pos = bufferIndexOf(this, search, start)) > -1) {
     ret.push(this.slice(start, pos));
     start = pos + searchLen;
   }
@@ -1576,6 +1576,34 @@ Buffer.prototype.split = function(str) {
   
   return ret;
 };
+
+function bufferIndexOf(buffer, str, start) {
+  if (str.length > buffer.length)
+    return -1;
+  var search = !Array.isArray(str)
+                ? str.split('').map(function(el) { return el.charCodeAt(0); })
+                : str,
+      searchLen = search.length,
+      ret = -1, i, j, len;
+  for (i=start||0,len=buffer.length; i<len; ++i) {
+    if (buffer[i] == search[0] && (len-i) >= searchLen) {
+      if (searchLen > 1) {
+        for (j=1; j<searchLen; ++j) {
+          if (buffer[i+j] != search[j])
+            break;
+          else if (j == searchLen-1) {
+            ret = i;
+            break;
+          }
+        }
+      } else
+        ret = i;
+      if (ret > -1)
+        break;
+    }
+  }
+  return ret;  
+}
 
 Buffer.prototype.indexOf = function(str, start) {
   if (str.length > this.length)
