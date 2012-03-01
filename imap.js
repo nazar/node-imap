@@ -8,7 +8,7 @@ var emptyFn = function() {}, CRLF = '\r\n', debug=emptyFn,
       BOXSELECTING: 3,
       BOXSELECTED: 4
     }, BOX_ATTRIBS = ['NOINFERIORS', 'NOSELECT', 'MARKED', 'UNMARKED'],
-    reFetch = /^\* (\d+) FETCH .+? \{(\d+)\}\r\n/;
+    reFetch = /^\* (\d+) FETCH [\s\S]+? \{(\d+)\}\r\n/;
 
 function ImapConnection (options) {
   if (!(this instanceof ImapConnection))
