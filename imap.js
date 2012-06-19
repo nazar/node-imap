@@ -80,6 +80,8 @@ exports.ImapConnection = ImapConnection;
 ImapConnection.prototype.connect = function(loginCb) {
   var self = this,
       fnInit = function() {
+        // set a connection ID for future reference
+        self.internalImapConnectionId = Date.now();
         // First get pre-auth capabilities, including server-supported auth
         // mechanisms
         self._send('CAPABILITY', function() {
@@ -89,8 +91,6 @@ ImapConnection.prototype.connect = function(loginCb) {
               loginCb(err);
               return;
             }
-            // set a connection ID for future reference
-            self.internalImapConnectionId = Date.now();
             // Next, get the list of available namespaces if supported
             if (!reentry && self.capabilities.indexOf('NAMESPACE') > -1) {
               var fnMe = arguments.callee;
