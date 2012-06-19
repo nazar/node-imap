@@ -4,7 +4,7 @@ Description
 node-imap is an IMAP module for [node.js](http://nodejs.org/) that provides an asynchronous interface for communicating with an IMAP mail server.
 
 This module does not perform any magic such as auto-decoding of messages/attachments or parsing of email addresses (node-imap leaves all mail header values as-is).
-If you are in need of this kind of extra functionality, check out andris9's [mime.js](http://github.com/andris9/mailparser/blob/master/mime.js) (requires [node-iconv](http://github.com/bnoordhuis/node-iconv)) set of functions, part of his [mailparser](http://github.com/andris9/mailparser) module.
+If you are in need of this kind of extra functionality, check out andris9's [mimelib](https://github.com/andris9/mimelib) module. Also check out his [mailparser](http://github.com/andris9/mailparser) module, which comes in handy after you fetch() a 'full' raw email message with this module.
 
 
 Requirements
@@ -235,8 +235,9 @@ ImapConnection Functions
 **Note:** Message ID sets for message ID range arguments are not guaranteed to be contiguous.
 
 * **(constructor)**([Object]) - _ImapConnection_ - Creates and returns a new instance of ImapConnection using the specified configuration object. Valid properties of the passed in object are:
-    * **username** - A String representing the username for authentication.
-    * **password** - A String representing the password for authentication.
+    * **username** - A String representing the username for plain-text authentication.
+    * **password** - A String representing the password for plain-text authentication.
+    * **xoauth** - A String containing an OAuth token for [OAuth authentication](https://sites.google.com/site/oauthgoog/Home/oauthimap) for servers that support it.
     * **host** - A String representing the hostname or IP address of the IMAP server. **Default:** "localhost"
     * **port** - An Integer representing the port of the IMAP server. **Default:** 143
     * **secure** - A Boolean indicating the connection should use SSL/TLS. **Default:** false
@@ -317,6 +318,11 @@ ImapConnection Functions
 
 * **removeDeleted**(Function) - _(void)_ - Permanently removes (EXPUNGEs) all messages flagged as Deleted in the mailbox that is currently open. The Function parameter is the callback with one parameter: the error (null if none). **Note:** At least on Gmail, performing this operation with any currently open mailbox that is not the Spam or Trash mailbox will merely archive any messages marked as Deleted (by moving them to the 'All Mail' mailbox).
 
+* **append**(Buffer/String, [Object,] Function) - _(void)_ - Appends a message to selected mailbox. The first parameter is a string or Buffer containing an RFC-822 compatible MIME message. The Function parameter is the callback with one parameter: the error (null if none). The second parameter is an options object. Valid options are:
+    * **mailbox** - The name of the mailbox to append the message to. **Default:** the currently open mailbox
+    * **flags** - Either a string (e.g. 'Seen') or an Array (e.g. `['Seen', 'Flagged']`) of flags to append to the message. **Default:** (no flags)
+    * **date** - A Date object that denotes when the message was received. **Default:** (current date/time)
+
 **All functions below have sequence number-based counterparts that can be accessed by using the 'seq' namespace of the imap connection's instance (e.g. conn.seq.search() returns sequence numbers instead of unique ids, conn.seq.fetch() fetches by sequence number(s) instead of unique ids, etc):**
 
 * **search**(Array, Function) - _(void)_ - Searches the currently open mailbox for messages using specific criterion. The Function parameter is the callback with two parameters: the error (null if none) and an Array containing the message IDs matching the search criterion. The Array parameter is a list of Arrays containing the criterion (and any required arguments) to be used. Prefix the criteria name with an "!" to negate. For example, to search for unread messages since April 20, 2010 you could use: [ 'UNSEEN', ['SINCE', 'April 20, 2010'] ]. To search for messages that are EITHER unread OR are dated April 20, 2010 or later, you could use: [ ['OR', 'UNSEEN', ['SINCE', 'April 20, 2010'] ] ].
@@ -356,27 +362,27 @@ ImapConnection Functions
         * 'LARGER' - Messages with a size larger than the specified number of bytes.
         * 'SMALLER' - Messages with a size smaller than the specified number of bytes.
     * The following are valid criterion that require one or more Integer values:
-        * 'UID' - Messages with message IDs corresponding to the specified message ID set. Ranges are permitted (e.g. '2504:2507' or '*' or '2504:*').
+        * 'UID' - Messages with message IDs corresponding to the specified message ID set. Ranges are permitted (e.g. '2504:2507' or '\*' or '2504:\*').
     * **Note:** By default, all criterion are ANDed together. You can use the special 'OR' on **two** criterion to find messages matching either search criteria (see example above).
 
-* **fetch**(Integer/String/Array, Object) - _ImapFetch_ - Fetches the message(s) identified by the first parameter, in the currently open mailbox. The first parameter can either be an Integer for a single message ID, a String for a message ID range (e.g. '2504:2507' or '*' or '2504:*'), or an Array containing any number of the aforementioned Integers and/or Strings. The second (Object) parameter is a set of options used to determine how and what exactly to fetch. The valid options are:
+* **fetch**(Integer/String/Array, Object) - _ImapFetch_ - Fetches the message(s) identified by the first parameter, in the currently open mailbox. The first parameter can either be an Integer for a single message ID, a String for a message ID range (e.g. '2504:2507' or '\*' or '2504:\*'), or an Array containing any number of the aforementioned Integers and/or Strings. The second (Object) parameter is a set of options used to determine how and what exactly to fetch. The valid options are:
     * **markSeen** - A Boolean indicating whether to mark the message(s) as read when fetching it. **Default:** false
     * **request** - An Object indicating what to fetch (at least **headers** OR **body** must be set to false -- in other words, you can only fetch one aspect of the message at a time):
         * **struct** - A Boolean indicating whether to fetch the structure of the message. **Default:** true
         * **headers** - A Boolean/Array value. A value of true fetches all message headers. An Array containing specific message headers to retrieve can also be specified. **Default:** true
         * **body** - A Boolean/String/Array value. A Boolean value of true fetches the entire raw message body. A String value containing a valid partID (see _FetchResult_'s structure property) fetches the entire body/content of that particular part, or a String value of 'full' fetches the entire email message, including the headers. An Array value of length 2 can be specified if you wish to request a byte range of the content, where the first item is a Boolean/String as previously described and the second item is a String indicating the byte range, for example, to fetch the first 500 bytes: '0-500'. **Default:** false
 
-* **copy**(Integer/String/Array, String, Function) - _(void)_ - Copies the message(s) with the message ID(s) identified by the first parameter, in the currently open mailbox, to the mailbox specified by the second parameter. The first parameter can either be an Integer for a single message ID, a String for a message ID range (e.g. '2504:2507' or '*' or '2504:*'), or an Array containing any number of the aforementioned Integers and/or Strings. The Function parameter is the callback with one parameter: the error (null if none).
+* **copy**(Integer/String/Array, String, Function) - _(void)_ - Copies the message(s) with the message ID(s) identified by the first parameter, in the currently open mailbox, to the mailbox specified by the second parameter. The first parameter can either be an Integer for a single message ID, a String for a message ID range (e.g. '2504:2507' or '\*' or '2504:\*'), or an Array containing any number of the aforementioned Integers and/or Strings. The Function parameter is the callback with one parameter: the error (null if none).
 
-* **move**(Integer/String/Array, String, Function) - _(void)_ - Moves the message(s) with the message ID(s) identified by the first parameter, in the currently open mailbox, to the mailbox specified by the second parameter. The first parameter can either be an Integer for a single message ID, a String for a message ID range (e.g. '2504:2507' or '*' or '2504:*'), or an Array containing any number of the aforementioned Integers and/or Strings. The Function parameter is the callback with one parameter: the error (null if none). **Note:** The message in the destination mailbox will have a new message ID.
+* **move**(Integer/String/Array, String, Function) - _(void)_ - Moves the message(s) with the message ID(s) identified by the first parameter, in the currently open mailbox, to the mailbox specified by the second parameter. The first parameter can either be an Integer for a single message ID, a String for a message ID range (e.g. '2504:2507' or '\*' or '2504:\*'), or an Array containing any number of the aforementioned Integers and/or Strings. The Function parameter is the callback with one parameter: the error (null if none). **Note:** The message in the destination mailbox will have a new message ID.
 
-* **addFlags**(Integer/String/Array, String/Array, Function) - _(void)_ - Adds the specified flag(s) to the message(s) identified by the first parameter. The first parameter can either be an Integer for a single message ID, a String for a message ID range (e.g. '2504:2507' or '*' or '2504:*'), or an Array containing any number of the aforementioned Integers and/or Strings. The second parameter can either be a String containing a single flag or can be an Array of flags. The Function parameter is the callback with one parameter: the error (null if none).
+* **addFlags**(Integer/String/Array, String/Array, Function) - _(void)_ - Adds the specified flag(s) to the message(s) identified by the first parameter. The first parameter can either be an Integer for a single message ID, a String for a message ID range (e.g. '2504:2507' or '\*' or '2504:\*'), or an Array containing any number of the aforementioned Integers and/or Strings. The second parameter can either be a String containing a single flag or can be an Array of flags. The Function parameter is the callback with one parameter: the error (null if none).
 
-* **delFlags**(Integer/String/Array, String/Array, Function) - _(void)_ - Removes the specified flag(s) from the message(s) identified by the first parameter. The first parameter can either be an Integer for a single message ID, a String for a message ID range (e.g. '2504:2507' or '*' or '2504:*'), or an Array containing any number of the aforementioned Integers and/or Strings. The second parameter can either be a String containing a single flag or can be an Array of flags. The Function parameter is the callback with one parameter: the error (null if none).
+* **delFlags**(Integer/String/Array, String/Array, Function) - _(void)_ - Removes the specified flag(s) from the message(s) identified by the first parameter. The first parameter can either be an Integer for a single message ID, a String for a message ID range (e.g. '2504:2507' or '\*' or '2504:\*'), or an Array containing any number of the aforementioned Integers and/or Strings. The second parameter can either be a String containing a single flag or can be an Array of flags. The Function parameter is the callback with one parameter: the error (null if none).
 
-* **addKeywords**(Integer/String/Array, String/Array, Function) - _(void)_ - Adds the specified keyword(s) to the message(s) identified by the first parameter. The first parameter can either be an Integer for a single message ID, a String for a message ID range (e.g. '2504:2507' or '*' or '2504:*'), or an Array containing any number of the aforementioned Integers and/or Strings. The second parameter can either be a String containing a single keyword or can be an Array of keywords. The Function parameter is the callback with one parameter: the error (null if none).
+* **addKeywords**(Integer/String/Array, String/Array, Function) - _(void)_ - Adds the specified keyword(s) to the message(s) identified by the first parameter. The first parameter can either be an Integer for a single message ID, a String for a message ID range (e.g. '2504:2507' or '\*' or '2504:\*'), or an Array containing any number of the aforementioned Integers and/or Strings. The second parameter can either be a String containing a single keyword or can be an Array of keywords. The Function parameter is the callback with one parameter: the error (null if none).
 
-* **delKeywords**(Integer/String/Array, String/Array, Function) - _(void)_ - Removes the specified keyword(s) from the message(s) identified by the first parameter. The first parameter can either be an Integer for a single message ID, a String for a message ID range (e.g. '2504:2507' or '*' or '2504:*'), or an Array containing any number of the aforementioned Integers and/or Strings. The second parameter can either be a String containing a single keyword or can be an Array of keywords. The Function parameter is the callback with one parameter: the error (null if none).
+* **delKeywords**(Integer/String/Array, String/Array, Function) - _(void)_ - Removes the specified keyword(s) from the message(s) identified by the first parameter. The first parameter can either be an Integer for a single message ID, a String for a message ID range (e.g. '2504:2507' or '\*' or '2504:\*'), or an Array containing any number of the aforementioned Integers and/or Strings. The second parameter can either be a String containing a single keyword or can be an Array of keywords. The Function parameter is the callback with one parameter: the error (null if none).
 
 
 Extensions Supported
@@ -395,11 +401,12 @@ Extensions Supported
 TODO
 ----
 
-A bunch of things not yet implemented in no particular order:
+Several things not yet implemented in no particular order:
 
 * Support STARTTLS
 * Support AUTH=CRAM-MD5/AUTH=CRAM_MD5 authentication
 * Support additional IMAP commands/extensions:
+  * NOTIFY (via NOTIFY extension -- http://tools.ietf.org/html/rfc5465)
   * STATUS addition to LIST (via LIST-STATUS extension -- http://tools.ietf.org/html/rfc5819)
   * GETQUOTA (via QUOTA extension -- http://tools.ietf.org/html/rfc2087)
   * UNSELECT (via UNSELECT extension -- http://tools.ietf.org/html/rfc3691)

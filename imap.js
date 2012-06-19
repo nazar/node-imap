@@ -1,6 +1,7 @@
 var util = require('util'), net = require('net'),
-    tls = require('tls'), EventEmitter = require('events').EventEmitter;
-var emptyFn = function() {}, CRLF = '\r\n', debug=emptyFn,
+    tls = require('tls'), EventEmitter = require('events').EventEmitter,
+    Socket = net.Socket;
+var emptyFn = function() {}, CRLF = '\r\n',
     STATES = {
       NOCONNECT: 0,
       NOAUTH: 1,
@@ -8,7 +9,13 @@ var emptyFn = function() {}, CRLF = '\r\n', debug=emptyFn,
       BOXSELECTING: 3,
       BOXSELECTED: 4
     }, BOX_ATTRIBS = ['NOINFERIORS', 'NOSELECT', 'MARKED', 'UNMARKED'],
+    MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep',
+              'Oct', 'Nov', 'Dec'],
     reFetch = /^\* (\d+) FETCH [\s\S]+? \{(\d+)\}\r\n/;
+
+var IDLE_NONE = 1,
+    IDLE_WAIT = 2,
+    IDLE_READY = 3;
 
 function ImapConnection (options) {
   if (!(this instanceof ImapConnection))
@@ -49,10 +56,10 @@ function ImapConnection (options) {
       messages: { total: 0, new: 0 }
     },
     ext: {
-      // Capability-specific state stuff
+      // Capability-specific state info
       idle: {
         MAX_WAIT: 1740000, // 29 mins in ms
-        sentIdle: false,
+        state: IDLE_NONE,
         timeWaited: 0 // ms
       }
     }
@@ -60,16 +67,15 @@ function ImapConnection (options) {
   this._options = extend(true, this._options, options);
 
   if (typeof this._options.debug === 'function')
-    debug = this._options.debug;
+    this.debug = this._options.debug;
+  else
+    this.debug = emptyFn;
   this.delim = null;
   this.namespaces = { personal: [], other: [], shared: [] };
   this.capabilities = [];
 };
 util.inherits(ImapConnection, EventEmitter);
 exports.ImapConnection = ImapConnection;
-
-/* Namespace for seqno-based commands */
-ImapConnection.prototype.seq = {};
 
 ImapConnection.prototype.connect = function(loginCb) {
   var self = this,
@@ -93,24 +99,22 @@ ImapConnection.prototype.connect = function(loginCb) {
             }
             // Lastly, get the top-level mailbox hierarchy delimiter used by the
             // server
-            self._send('LIST "" ""', loginCb);
+            self._send((self.capabilities.indexOf('XLIST') === -1
+                        ? 'LIST' : 'XLIST') + ' "" ""', loginCb);
           });
         });
       };
   loginCb = loginCb || emptyFn;
   this._reset();
 
-  this._state.conn = net.createConnection(this._options.port, this._options.host);
-
-  this._state.tmrConn = setTimeout(this._fnTmrConn.bind(this),
-                                   this._options.connTimeout, loginCb);
+  this._state.conn = new Socket();
   this._state.conn.setKeepAlive(true);
 
   if (this._options.secure) {
     // TODO: support STARTTLS
     this._state.conn.cleartext = this._state.conn.setSecure();
     this._state.conn.on('secure', function() {
-      debug('Secure connection made.');
+      self.debug('Secure connection made.');
     });
     //this._state.conn.cleartext.setEncoding('utf8');
   } else {
@@ -120,7 +124,7 @@ ImapConnection.prototype.connect = function(loginCb) {
 
   this._state.conn.on('connect', function() {
     clearTimeout(self._state.tmrConn);
-    debug('Connected to host.');
+    self.debug('Connected to host.');
     self._state.conn.cleartext.write('');
     self._state.status = STATES.NOAUTH;
   });
@@ -130,10 +134,10 @@ ImapConnection.prototype.connect = function(loginCb) {
   this._state.conn.cleartext.on('data', function(data) {
     if (data.length === 0) return;
     var trailingCRLF = false, literalInfo;
-    debug('\n<<RECEIVED>>: ' + util.inspect(data.toString()) + '\n');
+    self.debug('\n<<RECEIVED>>: ' + util.inspect(data.toString()) + '\n');
 
     if (self._state.curExpected === 0) {
-      if (data.indexOf(CRLF) === -1) {
+      if (bufferIndexOf(data, CRLF) === -1) {
         if (self._state.curData)
           self._state.curData = bufferAppend(self._state.curData, data);
         else
@@ -197,7 +201,7 @@ ImapConnection.prototype.connect = function(loginCb) {
           } else
             restDesc[1] = '';
           parseFetch(curReq._desc + restDesc[1], curReq._headers, curReq._msg);
-          data = self._state.curData.slice(self._state.curData.indexOf(CRLF)
+          data = self._state.curData.slice(bufferIndexOf(self._state.curData, CRLF)
                                            + 2);
           curReq._done = false;
           self._state.curXferred = 0;
@@ -215,11 +219,11 @@ ImapConnection.prototype.connect = function(loginCb) {
     } else if (self._state.curExpected === 0
                && (literalInfo = (strdata = data.toString()).match(reFetch))) {
       self._state.curExpected = parseInt(literalInfo[2], 10);
-      var idxCRLF = data.indexOf(CRLF),
+      var idxCRLF = bufferIndexOf(data, CRLF),
           curReq = self._state.requests[0],
           type = /BODY\[(.*)\](?:\<\d+\>)?/.exec(strdata.substring(0, idxCRLF)),
           msg = new ImapMessage(),
-          desc = strdata.substring(data.indexOf('(')+1, idxCRLF).trim();
+          desc = strdata.substring(bufferIndexOf(data, '(')+1, idxCRLF).trim();
       msg.seqno = parseInt(literalInfo[1], 10);
       type = type[1];
       curReq._desc = desc;
@@ -237,7 +241,7 @@ ImapConnection.prototype.connect = function(loginCb) {
     if (data.length === 0)
       return;
     var endsInCRLF = (data[data.length-2] === 13 && data[data.length-1] === 10);
-    data = data.split(CRLF);
+    data = bufferSplit(data, CRLF);
 
     // Defer any extra server responses found in the incoming data
     if (data.length > 1) {
@@ -324,15 +328,12 @@ ImapConnection.prototype.connect = function(loginCb) {
           parseNamespaces(data[2], self.namespaces);
         break;
         case 'SEARCH':
-          self._state.requests[0].args.push(typeof data[2] === 'undefined'
+          self._state.requests[0].args.push(data[2] === undefined
                                             || data[2].length === 0
                                             ? [] : data[2].split(' '));
         break;
-        /*case 'STATUS':
-          var result = /UIDNEXT ([\d]+)\)$/.exec(data[2]);
-          self._state.requests[0].args.push(parseInt(result[1]));
-        break;*/
         case 'LIST':
+        case 'XLIST':
           var result;
           if (self.delim === null
               && (result = /^\(\\No[sS]elect\) (.+?) .*$/.exec(data[2])))
@@ -341,18 +342,18 @@ ImapConnection.prototype.connect = function(loginCb) {
           else if (self.delim !== null) {
             if (self._state.requests[0].args.length === 0)
               self._state.requests[0].args.push({});
-            result = /^\((.*)\) (.+?) "?([^"]+)"?$/.exec(data[2]);
+            result = /^\((.*)\) (.+?) (.+)$/.exec(data[2]);
             var box = {
-              attribs: result[1].split(' ').map(function(attrib) {
-                         return attrib.substr(1).toUpperCase();
-                       }).filter(function(attrib) {
-                         return (BOX_ATTRIBS.indexOf(attrib) > -1);
-                       }),
-              delim: (result[2] === 'NIL'
-                      ? false : result[2].substring(1, result[2].length-1)),
-              children: null,
-              parent: null
-            }, name = result[3], curChildren = self._state.requests[0].args[0];
+                  attribs: result[1].split(' ').map(function(attrib) {
+                             return attrib.substr(1).toUpperCase();
+                           }),
+                  delim: (result[2] === 'NIL'
+                          ? false : result[2].substring(1, result[2].length-1)),
+                  children: null,
+                  parent: null
+                }, name = result[3], curChildren = self._state.requests[0].args[0];
+            if (name[0] === '"' && name[name.length-1] === '"')
+              name = name.substring(1, name.length - 1);
 
             if (box.delim) {
               var path = name.split(box.delim).filter(isNotEmpty),
@@ -368,14 +369,15 @@ ImapConnection.prototype.connect = function(loginCb) {
               }
               box.parent = parent;
             }
-            curChildren[name] = box;
+            if (!curChildren[name])
+              curChildren[name] = box;
           }
         break;
         default:
           if (/^\d+$/.test(data[1])) {
             var isUnsolicited = (self._state.requests[0] &&
                       self._state.requests[0].command.indexOf('NOOP') > -1) ||
-                      (self._state.isIdle && self._state.ext.idle.sentIdle);
+                      (self._state.isIdle && self._state.ext.idle.state === IDLE_READY);
             switch (data[2]) {
               case 'EXISTS':
                 // mailbox total message count
@@ -417,7 +419,14 @@ ImapConnection.prototype.connect = function(loginCb) {
             }
           }
       }
-    } else if (data[0][0] === 'A') { // Tagged server response
+    } else if (data[0][0] === 'A' || data[0] === '+') {
+      // Tagged server response or continuation response
+
+      if (data[0] === '+' && self._state.ext.idle.state === IDLE_WAIT) {
+        self._state.ext.idle.state = IDLE_READY;
+        return process.nextTick(function() { self._send(); });
+      }
+
       var sendBox = false;
       clearTimeout(self._state.tmrKeepalive);
 
@@ -441,7 +450,14 @@ ImapConnection.prototype.connect = function(loginCb) {
         var err = null;
         var args = self._state.requests[0].args,
             cmd = self._state.requests[0].command;
-        if (data[1] !== 'OK') {
+        if (data[0] === '+') {
+          if (cmd.indexOf('APPEND') !== 0) {
+            err = new Error('Unexpected continuation');
+            err.type = 'continuation';
+            err.request = cmd;
+          } else
+            return self._state.requests[0].callback();
+        } else if (data[1] !== 'OK') {
           err = new Error('Error while executing request: ' + data[2]);
           err.type = data[1];
           err.request = cmd;
@@ -473,11 +489,11 @@ ImapConnection.prototype.connect = function(loginCb) {
         }
         self._state.tmrKeepalive = setTimeout(function() {
           if (self._state.isIdle) {
-            if (self._state.ext.idle.sentIdle) {
+            if (self._state.ext.idle.state === IDLE_READY) {
               self._state.ext.idle.timeWaited += self._state.tmoKeepalive;
               if (self._state.ext.idle.timeWaited >= self._state.ext.idle.MAX_WAIT)
                 self._send('IDLE', undefined, true); // restart IDLE
-            } else
+            } else if (self.capabilities.indexOf('IDLE') === -1)
               self._noop();
           }
         }, self._state.tmoKeepalive);
@@ -486,16 +502,18 @@ ImapConnection.prototype.connect = function(loginCb) {
 
       self._state.isIdle = true;
     } else if (data[0] === 'IDLE') {
-      if (self._state.requests.length > 0)
+      if (self._state.requests.length)
         process.nextTick(function() { self._send(); });
       self._state.isIdle = false;
+      self._state.ext.idle.state = IDLE_NONE;
+      self._state.ext.idle.timeWaited = 0;
     } else {
       // unknown response
     }
   });
   this._state.conn.on('end', function() {
     self._reset();
-    debug('FIN packet received. Disconnecting...');
+    self.debug('FIN packet received. Disconnecting...');
     self.emit('end');
   });
   this._state.conn.on('error', function(err) {
@@ -503,13 +521,17 @@ ImapConnection.prototype.connect = function(loginCb) {
     if (self._state.status === STATES.NOCONNECT)
       loginCb(new Error('Unable to connect. Reason: ' + err));
     self.emit('error', err);
-    debug('Error occurred: ' + err);
+    self.debug('Error occurred: ' + err);
   });
   this._state.conn.on('close', function(had_error) {
     self._reset();
-    debug('Connection forcefully closed.');
+    self.debug('Connection forcefully closed.');
     self.emit('close', had_error);
   });
+
+  this._state.conn.connect(this._options.port, this._options.host);
+  this._state.tmrConn = setTimeout(this._fnTmrConn.bind(this),
+                                   this._options.connTimeout, loginCb);
 };
 
 ImapConnection.prototype.isAuthenticated = function() {
@@ -528,12 +550,11 @@ ImapConnection.prototype.openBox = function(name, readOnly, cb) {
     throw new Error('Not connected or authenticated');
   if (this._state.status === STATES.BOXSELECTED)
     this._resetBox();
-  if (typeof cb === 'undefined') {
-    if(typeof readOnly === 'undefined') {
+  if (cb === undefined) {
+    if (readOnly === undefined)
       cb = emptyFn;
-    } else {
+    else
       cb = readOnly;
-    }
     readOnly = false;
   }
   this._state.status = STATES.BOXSELECTING;
@@ -568,7 +589,7 @@ ImapConnection.prototype.getBoxes = function(namespace, cb) {
   cb = arguments[arguments.length-1];
   if (arguments.length !== 2)
     namespace = '';
-  this._send('LIST "' + escape(namespace) + '" "*"', cb);
+  this._send(((this.capabilities.indexOf('XLIST') == -1) ? 'LIST' : 'XLIST') + ' "' + escape(namespace) + '" "*"', cb);
 };
 
 ImapConnection.prototype.addBox = function(name, cb) {
@@ -598,13 +619,10 @@ ImapConnection.prototype.renameBox = function(oldname, newname, cb) {
   if (this._state.status === STATES.BOXSELECTED
       && oldname === this._state.box.name && oldname !== 'INBOX')
     this._state.box._newName = oldname;
-    
+
   this._send('RENAME "' + escape(oldname) + '" "' + escape(newname) + '"', cb);
 };
 
-ImapConnection.prototype.seq.search = function(options, cb) {
-  this._search('', options, cb);
-};
 ImapConnection.prototype.search = function(options, cb) {
   this._search('UID ', options, cb);
 };
@@ -617,9 +635,47 @@ ImapConnection.prototype._search = function(which, options, cb) {
              + buildSearchQuery(options, this.capabilities), cb);
 };
 
-ImapConnection.prototype.seq.fetch = function(seqnos, options) {
-  return this._fetch('', seqnos, options);
-};
+ImapConnection.prototype.append = function(data, options, cb) {
+  if (typeof options === 'function') {
+    cb = options;
+    options = {};
+  }
+  options = options || {};
+  if (!('mailbox' in options)) {
+    if (this._state.status !== STATES.BOXSELECTED)
+      throw new Error('No mailbox specified or currently selected');
+    else
+      options.mailbox = this._state.box.name
+  }
+  cmd = 'APPEND "'+escape(options.mailbox)+'"';
+  if ('flags' in options) {
+    if (!Array.isArray(options.flags))
+      options.flags = Array(options.flags);
+    cmd += " (\\"+options.flags.join(' \\')+")";
+  }
+  if ('date' in options) {
+    if (!(options.date instanceof Date))
+      throw new Error('Expected null or Date object for date');
+    cmd += ' "'+options.date.getDate()+'-'+MONTHS[options.date.getMonth()]+'-'+options.date.getFullYear();
+    cmd += ' '+('0'+options.date.getHours()).slice(-2)+':'+('0'+options.date.getMinutes()).slice(-2)+':'+('0'+options.date.getSeconds()).slice(-2);
+    cmd += ((options.date.getTimezoneOffset() > 0) ? ' -' : ' +' );
+    cmd += ('0'+(-options.date.getTimezoneOffset() / 60)).slice(-2);
+    cmd += ('0'+(-options.date.getTimezoneOffset() % 60)).slice(-2);
+    cmd += '"';
+  }
+  cmd += ' {';
+  cmd += (Buffer.isBuffer(data) ? data.length : Buffer.byteLength(data));
+  cmd += '}';
+  var self = this, step = 1;
+  this._send(cmd, function(err) {
+    if (err || step++ === 2)
+      return cb(err);
+    self._state.conn.cleartext.write(data);
+    self._state.conn.cleartext.write(CRLF);
+    self.debug('\n<<SENT>>: ' + util.inspect(data.toString()) + '\n');
+  });
+}
+
 ImapConnection.prototype.fetch = function(uids, options) {
   return this._fetch('UID ', uids, options);
 };
@@ -627,7 +683,7 @@ ImapConnection.prototype._fetch = function(which, uids, options) {
   if (this._state.status !== STATES.BOXSELECTED)
     throw new Error('No mailbox is currently selected');
 
-  if (typeof uids === undefined || typeof uids === null
+  if (uids === undefined || uids === null
       || (Array.isArray(uids) && uids.length === 0))
     throw new Error('Nothing to fetch');
 
@@ -691,7 +747,7 @@ ImapConnection.prototype._fetch = function(which, uids, options) {
     extensions = 'X-GM-THRID X-GM-MSGID X-GM-LABELS ';
 
   this._send(which + 'FETCH ' + uids.join(',') + ' (' + extensions
-             + 'FLAGS INTERNALDATE'
+             + 'UID FLAGS INTERNALDATE'
              + (opts.request.struct ? ' BODYSTRUCTURE' : '')
              + (typeof toFetch === 'string' ? ' BODY'
              + (!opts.markSeen ? '.PEEK' : '')
@@ -710,23 +766,14 @@ ImapConnection.prototype._fetch = function(which, uids, options) {
   return imapFetcher;
 };
 
-ImapConnection.prototype.seq.addFlags = function(seqnos, flags, cb) {
-  this._store('', seqnos, flags, true, cb);
-};
 ImapConnection.prototype.addFlags = function(uids, flags, cb) {
   this._store('UID ', uids, flags, true, cb);
 };
 
-ImapConnection.prototype.seq.delFlags = function(seqnos, flags, cb) {
-  this._store('', seqnos, flags, false, cb);
-};
 ImapConnection.prototype.delFlags = function(uids, flags, cb) {
   this._store('UID ', uids, flags, false, cb);
 };
 
-ImapConnection.prototype.seq.addKeywords = function(seqnos, flags, cb) {
-  return this._addKeywords('', seqnos, flags, cb);
-};
 ImapConnection.prototype.addKeywords = function(uids, flags, cb) {
   return this._addKeywords('UID ', uids, flags, cb);
 };
@@ -736,16 +783,10 @@ ImapConnection.prototype._addKeywords = function(which, uids, flags, cb) {
   this._store(which, uids, flags, true, cb);
 };
 
-ImapConnection.prototype.seq.delKeywords = function(seqnos, flags, cb) {
-  this._store('', seqnos, flags, false, cb);
-};
 ImapConnection.prototype.delKeywords = function(uids, flags, cb) {
   this._store('UID ', uids, flags, false, cb);
 };
 
-ImapConnection.prototype.seq.copy = function(seqnos, boxTo, cb) {
-  return this._copy('', seqnos, boxTo, cb);
-};
 ImapConnection.prototype.copy = function(uids, boxTo, cb) {
   return this._copy('UID ', uids, boxTo, cb);
 };
@@ -761,9 +802,6 @@ ImapConnection.prototype._copy = function(which, uids, boxTo, cb) {
   this._send(which + 'COPY ' + uids.join(',') + ' "' + escape(boxTo) + '"', cb);
 };
 
-ImapConnection.prototype.seq.move = function(seqnos, boxTo, cb) {
-  return this._move('', seqnos, boxTo, cb);
-};
 ImapConnection.prototype.move = function(uids, boxTo, cb) {
   return this._move('UID ', uids, boxTo, cb);
 };
@@ -786,7 +824,7 @@ ImapConnection.prototype._move = function(which, uids, boxTo, cb) {
       counter = counter || 0;
       // Make sure we don't expunge any messages marked as Deleted except the
       // one we are moving
-      if (typeof reentryCount === 'undefined') {
+      if (reentryCount === undefined) {
         self.search(['DELETED'], function(e, result) {
           fnMe.call(this, e, 1, result);
         });
@@ -821,6 +859,37 @@ ImapConnection.prototype._move = function(which, uids, boxTo, cb) {
   }
 };
 
+/* Namespace for seqno-based commands */
+ImapConnection.prototype.__defineGetter__('seq', function() {
+  var self = this;
+  return {
+    move: function(seqnos, boxTo, cb) {
+      return self._move('', seqnos, boxTo, cb);
+    },
+    copy: function(seqnos, boxTo, cb) {
+      return self._copy('', seqnos, boxTo, cb);
+    },
+    delKeywords: function(seqnos, flags, cb) {
+      self._store('', seqnos, flags, false, cb);
+    },
+    addKeywords: function(seqnos, flags, cb) {
+      return self._addKeywords('', seqnos, flags, cb);
+    },
+    delFlags: function(seqnos, flags, cb) {
+      self._store('', seqnos, flags, false, cb);
+    },
+    addFlags: function(seqnos, flags, cb) {
+      self._store('', seqnos, flags, true, cb);
+    },
+    fetch: function(seqnos, options) {
+      return self._fetch('', seqnos, options);
+    },
+    search: function(options, cb) {
+      self._search('', options, cb);
+    }
+  };
+});
+
 
 /****** Private Functions ******/
 
@@ -834,7 +903,7 @@ ImapConnection.prototype._store = function(which, uids, flags, isAdding, cb) {
                     || arguments.callee.caller === this.delKeywords);
   if (this._state.status !== STATES.BOXSELECTED)
     throw new Error('No mailbox is currently selected');
-  if (typeof uids === 'undefined')
+  if (uids === undefined)
     throw new Error('The message ID(s) must be specified');
 
   if (!Array.isArray(uids))
@@ -885,19 +954,21 @@ ImapConnection.prototype._login = function(cb) {
         }
         cb(err);
       };
+
   if (this._state.status === STATES.NOAUTH) {
-    if (this.capabilities.indexOf('LOGINDISABLED') > -1) {
-      cb(new Error('Logging in is disabled on this server'));
-      return;
-    }
-    //if (typeof this._state.capabilities['AUTH=PLAIN'] !== 'undefined') {
+    if (this.capabilities.indexOf('LOGINDISABLED') !== -1)
+      return cb(new Error('Logging in is disabled on this server'));
+
+    if (this.capabilities.indexOf('AUTH=XOAUTH') !== -1 && 'xoauth' in this._options)
+      this._send('AUTHENTICATE XOAUTH ' + escape(this._options.xoauth), fnReturn);
+    else if (this._options.username !== undefined &&
+             this._options.password !== undefined) {
       this._send('LOGIN "' + escape(this._options.username) + '" "'
                  + escape(this._options.password) + '"', fnReturn);
-    /*} else {
-      cb(new Error('Unsupported authentication mechanism(s) detected. '
-                   + 'Unable to login.'));
-      return;
-    }*/
+    } else {
+      return cb(new Error('No supported authentication method(s) available. '
+                          + 'Unable to login.'));
+    }
   }
 };
 ImapConnection.prototype._reset = function() {
@@ -908,7 +979,7 @@ ImapConnection.prototype._reset = function() {
   this._state.requests = [];
   this._state.isIdle = true;
   this._state.isReady = false;
-  this._state.ext.idle.sentIdle = false;
+  this._state.ext.idle.state = IDLE_NONE;
   this._state.ext.idle.timeWaited = 0;
 
   this.namespaces = { personal: [], other: [], shared: [] };
@@ -932,27 +1003,28 @@ ImapConnection.prototype._noop = function() {
     this._send('NOOP');
 };
 ImapConnection.prototype._send = function(cmdstr, cb, bypass) {
-  if (typeof cmdstr !== 'undefined' && !bypass)
+  if (cmdstr !== undefined && !bypass)
     this._state.requests.push({ command: cmdstr, callback: cb, args: [] });
-  if ((typeof cmdstr === 'undefined' && this._state.requests.length) ||
+  if (this._state.ext.idle.state === IDLE_WAIT)
+    return;
+  if ((cmdstr === undefined && this._state.requests.length) ||
       this._state.requests.length === 1 || bypass) {
     var prefix = '', cmd = (bypass ? cmdstr : this._state.requests[0].command);
     clearTimeout(this._state.tmrKeepalive);
-    if (this._state.ext.idle.sentIdle && cmd !== 'DONE') {
-      this._send('DONE', undefined, true);
-      this._state.ext.idle.sentIdle = false;
-      this._state.ext.idle.timeWaited = 0;
-      return;
-    } else if (cmd === 'IDLE') {
+    if (this._state.ext.idle.state === IDLE_READY && cmd !== 'DONE')
+      return this._send('DONE', undefined, true);
+    else if (cmd === 'IDLE') {
        // we use a different prefix to differentiate and disregard the tagged
        // response the server will send us when we issue DONE
       prefix = 'IDLE ';
-      this._state.ext.idle.sentIdle = true;
+      this._state.ext.idle.state = IDLE_WAIT;
     }
     if (cmd !== 'IDLE' && cmd !== 'DONE')
       prefix = 'A' + ++this._state.curId + ' ';
-    this._state.conn.cleartext.write(prefix + cmd + CRLF);
-    debug('\n<<SENT>>: ' + prefix + cmd + '\n');
+    this._state.conn.cleartext.write(prefix);
+    this._state.conn.cleartext.write(cmd);
+    this._state.conn.cleartext.write(CRLF);
+    this.debug('\n<<SENT>>: ' + prefix + cmd + '\n');
   }
 };
 
@@ -964,9 +1036,7 @@ util.inherits(ImapFetch, EventEmitter);
 /****** Utility Functions ******/
 
 function buildSearchQuery(options, extensions, isOrChild) {
-  var searchargs = '',
-      months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep',
-                'Oct', 'Nov', 'Dec'];
+  var searchargs = '';
   for (var i=0,len=options.length; i<len; i++) {
     var criteria = (isOrChild ? options : options[i]),
         args = null,
@@ -1036,7 +1106,7 @@ function buildSearchQuery(options, extensions, isOrChild) {
                               + ' or a parseable date string');
           }
           searchargs += modifier + criteria + ' ' + args[0].getDate() + '-'
-                        + months[args[0].getMonth()] + '-'
+                        + MONTHS[args[0].getMonth()] + '-'
                         + args[0].getFullYear();
         break;
         case 'KEYWORD':
@@ -1191,7 +1261,7 @@ function parseFetch(str, literalData, fetchData) {
 
 function parseBodyStructure(cur, prefix, partID) {
   var ret = [];
-  if (typeof prefix === 'undefined') {
+  if (prefix === undefined) {
     var result = (Array.isArray(cur) ? cur : parseExpr(cur));
     if (result.length)
       ret = parseBodyStructure(result, '', 1);
@@ -1492,22 +1562,22 @@ function extend() {
     if (!obj || toString.call(obj) !== "[object Object]" || obj.nodeType
         || obj.setInterval)
       return false;
-    
+
     var has_own_constructor = hasOwnProperty.call(obj, "constructor");
     var has_is_prop_of_method = hasOwnProperty.call(obj.constructor.prototype,
                                                     "isPrototypeOf");
     // Not own constructor property must be Object
     if (obj.constructor && !has_own_constructor && !has_is_prop_of_method)
       return false;
-    
+
     // Own properties are enumerated firstly, so to speed up,
     // if last one is own, then all properties are own.
 
     var last_key;
     for (var key in obj)
       last_key = key;
-    
-    return typeof last_key === "undefined" || hasOwnProperty.call(obj, last_key);
+
+    return last_key === undefined || hasOwnProperty.call(obj, last_key);
   };
 
 
@@ -1532,7 +1602,7 @@ function extend() {
           target[name] = extend(deep, clone, copy);
 
         // Don't bring in undefined values
-        } else if (typeof copy !== "undefined")
+        } else if (copy !== undefined)
           target[name] = copy;
       }
     }
@@ -1555,69 +1625,41 @@ function bufferAppend(buf1, buf2) {
   return newBuf;
 };
 
-Buffer.prototype.split = function(str) {
+function bufferSplit(buf, str) {
   if ((typeof str !== 'string' && !Array.isArray(str))
-      || str.length === 0 || str.length > this.length)
-    return [this];
+      || str.length === 0 || str.length > buf.length)
+    return [buf];
   var search = !Array.isArray(str)
                 ? str.split('').map(function(el) { return el.charCodeAt(0); })
                 : str,
       searchLen = search.length,
       ret = [], pos, start = 0;
 
-  while ((pos = bufferIndexOf(this, search, start)) > -1) {
-    ret.push(this.slice(start, pos));
+  while ((pos = bufferIndexOf(buf, search, start)) > -1) {
+    ret.push(buf.slice(start, pos));
     start = pos + searchLen;
   }
   if (!ret.length)
-    ret = [this];
-  else if (start < this.length)
-    ret.push(this.slice(start));
-  
+    ret = [buf];
+  else if (start < buf.length)
+    ret.push(buf.slice(start));
+
   return ret;
 };
 
-function bufferIndexOf(buffer, str, start) {
-  if (str.length > buffer.length)
+function bufferIndexOf(buf, str, start) {
+  if (str.length > buf.length)
     return -1;
   var search = !Array.isArray(str)
                 ? str.split('').map(function(el) { return el.charCodeAt(0); })
                 : str,
       searchLen = search.length,
       ret = -1, i, j, len;
-  for (i=start||0,len=buffer.length; i<len; ++i) {
-    if (buffer[i] == search[0] && (len-i) >= searchLen) {
+  for (i=start||0,len=buf.length; i<len; ++i) {
+    if (buf[i] == search[0] && (len-i) >= searchLen) {
       if (searchLen > 1) {
         for (j=1; j<searchLen; ++j) {
-          if (buffer[i+j] != search[j])
-            break;
-          else if (j == searchLen-1) {
-            ret = i;
-            break;
-          }
-        }
-      } else
-        ret = i;
-      if (ret > -1)
-        break;
-    }
-  }
-  return ret;  
-}
-
-Buffer.prototype.indexOf = function(str, start) {
-  if (str.length > this.length)
-    return -1;
-  var search = !Array.isArray(str)
-                ? str.split('').map(function(el) { return el.charCodeAt(0); })
-                : str,
-      searchLen = search.length,
-      ret = -1, i, j, len;
-  for (i=start||0,len=this.length; i<len; ++i) {
-    if (this[i] == search[0] && (len-i) >= searchLen) {
-      if (searchLen > 1) {
-        for (j=1; j<searchLen; ++j) {
-          if (this[i+j] != search[j])
+          if (buf[i+j] != search[j])
             break;
           else if (j == searchLen-1) {
             ret = i;
@@ -1656,7 +1698,7 @@ function pipe(pair, socket) {
 
   function onerror(e) {
     if (cleartext._controlReleased)
-      cleartext.socket.emit('error', e);
+      cleartext.emit('error', e);
   }
 
   function onclose() {
